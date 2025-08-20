@@ -2,122 +2,117 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import datetime as dt
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools import add_constant
 
 class PairsTradingSimulator:
-    def __init__(self, symbol1, symbol2, start_date, end_date):
+    def __init__(self, symbol1, symbol2, start_date, end_date, entry_k=2, exit_k=0.5, tx_cost=0.0005):
         self.symbol1 = symbol1
         self.symbol2 = symbol2
         self.start_date = start_date
         self.end_date = end_date
-        self.prices1 = self.load_prices(symbol1)
-        self.prices2 = self.load_prices(symbol2)
-        self.prices1_train = self.prices1[self.start_date:self.end_date]
-        self.prices2_train = self.prices2[self.start_date:self.end_date]
-        self.returns1 = self.calculate_returns(self.prices1_train)
-        self.returns2 = self.calculate_returns(self.prices2_train)
-        self.spread = None
-        self.entry_threshold = 1.0  # Example threshold for spread deviation
-        self.exit_threshold = 0.5   # Example threshold for spread reversion
-        self.positions1 = [0]
-        self.positions2 = [0]
-        self.equity_curve = [1.0]  # Start with initial capital of 1
+        self.entry_k = entry_k        # Entry threshold (z-score multiples)
+        self.exit_k = exit_k          # Exit threshold (z-score multiples)
+        self.tx_cost = tx_cost        # Transaction cost per trade
 
-    def load_prices(self, symbol):
-        # Fetch historical price data using yfinance
-        data = yf.download(symbol, start=self.start_date, end=self.end_date)
-        prices = data['Close']
-        return prices
+        # Load data
+        self.data = self.load_data()
+        self.hedge_ratio = self.estimate_hedge_ratio()
+        self.data['spread'] = self.data[self.symbol1] - self.hedge_ratio * self.data[self.symbol2]
+        self.data['zscore'] = (self.data['spread'] - self.data['spread'].mean()) / self.data['spread'].std()
 
-    def calculate_returns(self, prices):
-        # Calculate daily returns from price data
-        returns = prices.pct_change().fillna(0)
-        return returns
+        # Strategy placeholders
+        self.data['position'] = 0
+        self.data['equity'] = 1.0
 
-    def calculate_spread(self):
-        # Calculate spread between two securities
-        self.spread = self.prices1_train - self.prices2_train
+    def load_data(self):
+        df1 = yf.download(self.symbol1, start=self.start_date, end=self.end_date)['Close']
+        df2 = yf.download(self.symbol2, start=self.start_date, end=self.end_date)['Close']
+        data = pd.concat([df1, df2], axis=1)
+        data.columns = [self.symbol1, self.symbol2]
+        return data.dropna()
 
-    def simulate_pairs_trading(self):
-        # Simulate pairs trading strategy over historical data
-        self.calculate_spread()
-        for idx in range(1, len(self.spread)):
-            # Entry condition: spread widens beyond entry threshold
-            if self.spread[idx] > self.entry_threshold and self.positions1[-1] == 0:
-                self.positions1.append(1)
-                self.positions2.append(-1)
-            # Exit condition: spread reverts below exit threshold
-            elif self.spread[idx] < self.exit_threshold and self.positions1[-1] == 1:
-                self.positions1.append(0)
-                self.positions2.append(0)
-            else:
-                self.positions1.append(self.positions1[-1])
-                self.positions2.append(self.positions2[-1])
+    def estimate_hedge_ratio(self):
+        # Linear regression hedge ratio
+        y = self.data[self.symbol1]
+        x = add_constant(self.data[self.symbol2])
+        model = OLS(y, x).fit()
+        return model.params[1]  # Slope = hedge ratio
 
-            # Calculate equity curve based on position changes
-            self.equity_curve.append(self.calculate_equity_curve(idx))
+    def simulate(self):
+        position = 0
+        equity = 1.0
+        equity_curve = []
 
-    def calculate_equity_curve(self, idx):
-        # Calculate equity curve based on positions and price changes
-        if idx == 0:
-            return 1.0
-        else:
-            return self.equity_curve[-1] * (1 + self.positions1[-1] * self.returns1.iloc[idx] +
-                                            self.positions2[-1] * self.returns2.iloc[idx])
+        for i in range(1, len(self.data)):
+            z = self.data['zscore'].iloc[i]
 
-    def calculate_performance_metrics(self):
-        # Calculate performance metrics
-        cumulative_return = self.equity_curve[-1] - 1
-        daily_returns = pd.Series(self.equity_curve).pct_change().fillna(0)
-        annualized_return = (1 + cumulative_return) ** (252 / len(self.prices1_train)) - 1  # Assuming 252 trading days
-        annualized_volatility = np.std(daily_returns) * np.sqrt(252)
-        sharpe_ratio = (annualized_return - 0.02) / annualized_volatility  # Assuming risk-free rate of 2%
-        max_drawdown = np.min(self.equity_curve / np.maximum.accumulate(self.equity_curve)) - 1
+            # Entry rules
+            if z > self.entry_k and position == 0:
+                position = -1  # Short spread
+                equity -= self.tx_cost
+            elif z < -self.entry_k and position == 0:
+                position = 1   # Long spread
+                equity -= self.tx_cost
+
+            # Exit rules
+            elif abs(z) < self.exit_k and position != 0:
+                position = 0
+                equity -= self.tx_cost
+
+            # Daily PnL = position * spread change
+            spread_change = self.data['spread'].iloc[i] - self.data['spread'].iloc[i-1]
+            equity += position * spread_change / abs(self.data['spread'].iloc[i-1])
+
+            equity_curve.append(equity)
+            self.data['position'].iloc[i] = position
+            self.data['equity'].iloc[i] = equity
+
+        return pd.Series(equity_curve, index=self.data.index[1:])
+
+    def performance_metrics(self, equity_curve):
+        daily_returns = equity_curve.pct_change().dropna()
+        cumulative_return = equity_curve.iloc[-1] - 1
+        annualized_return = (1 + cumulative_return) ** (252 / len(equity_curve)) - 1
+        annualized_vol = daily_returns.std() * np.sqrt(252)
+        sharpe = (annualized_return - 0.02) / annualized_vol if annualized_vol > 0 else np.nan
+        max_dd = ((equity_curve / equity_curve.cummax()) - 1).min()
 
         return {
             "Cumulative Return": cumulative_return,
             "Annualized Return": annualized_return,
-            "Annualized Volatility": annualized_volatility,
-            "Sharpe Ratio": sharpe_ratio,
-            "Max Drawdown": max_drawdown
+            "Annualized Volatility": annualized_vol,
+            "Sharpe Ratio": sharpe,
+            "Max Drawdown": max_dd
         }
 
-    def plot_results(self):
-        # Plot equity curve and spread
-        plt.figure(figsize=(12, 6))
-        plt.subplot(2, 1, 1)
-        plt.plot(self.prices1_train.index, self.prices1_train.values, label=f"{self.symbol1} Prices")
-        plt.plot(self.prices2_train.index, self.prices2_train.values, label=f"{self.symbol2} Prices")
-        plt.legend(loc="upper left")
-        plt.title("Historical Prices")
+    def plot(self):
+        plt.figure(figsize=(12, 8))
 
-        plt.subplot(2, 1, 2)
-        plt.plot(self.prices1_train.index, self.spread, label="Spread")
-        plt.axhline(self.entry_threshold, color="r", linestyle="--", label="Entry Threshold")
-        plt.axhline(self.exit_threshold, color="g", linestyle="--", label="Exit Threshold")
-        plt.legend(loc="upper left")
-        plt.title("Spread and Trading Signals")
-        plt.xlabel("Date")
-        plt.ylabel("Spread")
+        plt.subplot(3, 1, 1)
+        plt.plot(self.data[self.symbol1], label=self.symbol1)
+        plt.plot(self.data[self.symbol2], label=self.symbol2)
+        plt.legend()
+        plt.title("Prices")
+
+        plt.subplot(3, 1, 2)
+        plt.plot(self.data['spread'], label="Spread")
+        plt.axhline(self.data['spread'].mean(), color='black', linestyle='--')
+        plt.title("Spread")
+
+        plt.subplot(3, 1, 3)
+        plt.plot(self.data['equity'], label="Equity Curve")
+        plt.title("Equity Curve")
         plt.tight_layout()
         plt.show()
 
-    def backtest(self):
-        # Conduct backtest of the pairs trading strategy
-        self.simulate_pairs_trading()
-        performance_metrics = self.calculate_performance_metrics()
-
-        print("\nPerformance Metrics:")
-        for metric, value in performance_metrics.items():
-            print(f"{metric}: {value}")
-
-        self.plot_results()
-
 if __name__ == "__main__":
-    symbol1 = "AAPL"  # Symbol of first security
-    symbol2 = "MSFT"  # Symbol of second security
-    start_date = "2019-01-01"
-    end_date = "2020-01-01"
+    sim = PairsTradingSimulator("AAPL", "MSFT", "2019-01-01", "2020-01-01")
+    equity_curve = sim.simulate()
+    metrics = sim.performance_metrics(equity_curve)
 
-    simulator = PairsTradingSimulator(symbol1, symbol2, start_date, end_date)
-    simulator.backtest()
+    print("\nPerformance Metrics:")
+    for k, v in metrics.items():
+        print(f"{k}: {v:.4f}")
+
+    sim.plot()
